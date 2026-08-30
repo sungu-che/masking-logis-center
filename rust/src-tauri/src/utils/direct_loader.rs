@@ -26,16 +26,26 @@ mod windows_impl {
 
     static CONTEXT: Lazy<Result<Arc<WinContext>>> = Lazy::new(|| {
         unsafe {
-            let factory: IDStorageFactory = DStorageGetFactory()?;
+            let factory: IDStorageFactory = DStorageGetFactory().map_err(|e| {
+                println!("[DirectLoader] DirectStorage factory init failed: {:?}. Falling back to fs::read/fs::write.", e);
+                e
+            })?;
             let queue_desc = DSTORAGE_QUEUE_DESC {
                 SourceType: DSTORAGE_REQUEST_SOURCE_FILE,
                 Capacity: DSTORAGE_MAX_QUEUE_CAPACITY as u16,
                 Priority: DSTORAGE_PRIORITY_NORMAL,
                 Name: windows::core::PCSTR::null(),
-                Device: ManuallyDrop::new(None), 
+                Device: ManuallyDrop::new(None),
             };
-            let queue = factory.CreateQueue(&queue_desc)?;
-            let status_array = factory.CreateStatusArray(1, None)?;
+            let queue = factory.CreateQueue(&queue_desc).map_err(|e| {
+                println!("[DirectLoader] DirectStorage queue creation failed: {:?}. Falling back to fs::read/fs::write.", e);
+                e
+            })?;
+            let status_array = factory.CreateStatusArray(1, None).map_err(|e| {
+                println!("[DirectLoader] DirectStorage status array creation failed: {:?}. Falling back to fs::read/fs::write.", e);
+                e
+            })?;
+            println!("[DirectLoader] DirectStorage context initialized successfully.");
             Ok(Arc::new(WinContext { factory, queue, status_array }))
         }
     });
@@ -63,9 +73,20 @@ mod windows_impl {
                         ctx.queue.EnqueueRequest(&request);
                         ctx.queue.EnqueueStatus(&ctx.status_array, 0);
                         ctx.queue.Submit();
-                        while !ctx.status_array.IsComplete(0) { std::thread::yield_now(); }
-                        if ctx.status_array.GetHResult(0).is_ok() {
+                        let start = std::time::Instant::now();
+                        let timeout = std::time::Duration::from_secs(30);
+                        while !ctx.status_array.IsComplete(0) {
+                            if start.elapsed() > timeout {
+                                println!("[DirectLoader] DirectStorage read timed out for {:?}. Falling back to fs::read.", path);
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_micros(100));
+                        }
+                        if ctx.status_array.IsComplete(0) && ctx.status_array.GetHResult(0).is_ok() {
                             return Ok(buffer);
+                        }
+                        if ctx.status_array.IsComplete(0) {
+                            println!("[DirectLoader] DirectStorage read returned error HRESULT for {:?}. Falling back to fs::read.", path);
                         }
                     }
                 }
@@ -86,18 +107,21 @@ mod windows_impl {
                 FILE_FLAG_OVERLAPPED | FILE_ATTRIBUTE_NORMAL,
                 Some(HANDLE::default()),
             );
-
             if let Ok(handle) = handle_res {
                 if !handle.is_invalid() {
                     let mut overlapped = OVERLAPPED::default();
                     let mut bytes_written = 0u32;
-                    let _ = WriteFile(handle, Some(data), Some(&mut bytes_written), Some(&mut overlapped));
-
+                    let write_result = WriteFile(handle, Some(data), Some(&mut bytes_written), Some(&mut overlapped));
                     let mut transferred = 0u32;
                     let result = GetOverlappedResult(handle, &overlapped, &mut transferred, true);
                     let _ = CloseHandle(handle);
                     if result.is_ok() {
-                        return Ok(());
+                        if transferred as usize == data.len() {
+                            return Ok(());
+                        }
+                        println!("[DirectLoader] Overlapped write incomplete for {:?}: wrote {} of {} bytes. Falling back to fs::write.", path, transferred, data.len());
+                    } else if write_result.is_err() {
+                        println!("[DirectLoader] Overlapped WriteFile failed for {:?}. Falling back to fs::write.", path);
                     }
                 }
             }
@@ -120,7 +144,11 @@ mod linux_impl {
     unsafe impl Sync for LinuxContext {}
 
     static CONTEXT: Lazy<Result<Arc<LinuxContext>>> = Lazy::new(|| {
-        let ring = IoUring::new(128).map_err(|e| anyhow!(e))?;
+        let ring = IoUring::new(128).map_err(|e| {
+            println!("[DirectLoader] io_uring init failed: {:?}. Falling back to fs::read/fs::write.", e);
+            anyhow!(e)
+        })?;
+        println!("[DirectLoader] io_uring context initialized successfully (128 entries).");
         Ok(Arc::new(LinuxContext { ring: Mutex::new(ring) }))
     });
 
@@ -133,6 +161,17 @@ mod linux_impl {
         let mut ring = ctx.ring.lock().unwrap();
         unsafe { ring.submission().push(&read_e).map_err(|e| anyhow!(e))?; }
         ring.submit_and_wait(1)?;
+        if let Some(cqe) = ring.completion().next() {
+            let result = cqe.result();
+            if result < 0 {
+                return Err(anyhow::anyhow!("io_uring read failed for {:?}: error code {}", path, result));
+            }
+            let bytes_read = result as usize;
+            if bytes_read < size {
+                println!("[DirectLoader] io_uring partial read for {:?}: got {} of {} bytes.", path, bytes_read, size);
+                buffer.truncate(bytes_read);
+            }
+        }
         Ok(buffer)
     }
 
@@ -143,6 +182,17 @@ mod linux_impl {
         let mut ring = ctx.ring.lock().unwrap();
         unsafe { ring.submission().push(&write_e).map_err(|e| anyhow!(e))?; }
         ring.submit_and_wait(1)?;
+        if let Some(cqe) = ring.completion().next() {
+            let result = cqe.result();
+            if result < 0 {
+                return Err(anyhow::anyhow!("io_uring write failed for {:?}: error code {}", path, result));
+            }
+            let bytes_written = result as usize;
+            if bytes_written < data.len() {
+                println!("[DirectLoader] io_uring partial write for {:?}: wrote {} of {} bytes.", path, bytes_written, data.len());
+                return Err(anyhow::anyhow!("io_uring partial write for {:?}: wrote {} of {} bytes", path, bytes_written, data.len()));
+            }
+        }
         Ok(())
     }
 }
@@ -156,8 +206,15 @@ mod macos_impl {
     unsafe impl Send for MacContext {}
     unsafe impl Sync for MacContext {}
     static CONTEXT: Lazy<Result<Arc<MacContext>>> = Lazy::new(|| {
-        let device = Device::system_default().ok_or_else(|| anyhow!("No Metal device found"))?;
-        let queue = device.new_io_command_queue(&IOCommandQueueDescriptor::new()).map_err(|e| anyhow!(e))?;
+        let device = Device::system_default().ok_or_else(|| {
+            println!("[DirectLoader] No Metal device found. Falling back to fs::read/fs::write.");
+            anyhow!("No Metal device found")
+        })?;
+        let queue = device.new_io_command_queue(&IOCommandQueueDescriptor::new()).map_err(|e| {
+            println!("[DirectLoader] Metal IO command queue creation failed: {}. Falling back to fs::read/fs::write.", e);
+            anyhow!(e)
+        })?;
+        println!("[DirectLoader] Metal IO command queue initialized successfully.");
         Ok(Arc::new(MacContext { queue }))
     });
     pub fn load_block(path: &Path) -> Result<Vec<u8>> {
