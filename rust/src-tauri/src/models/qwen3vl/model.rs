@@ -485,14 +485,21 @@ impl Qwen3VLVisionBlock {
         sin: &Tensor,
     ) -> Result<Tensor> {
         let orig_dtype = xs.dtype();
-        let residual = xs.clone();
-        let xs = self.norm1.forward(&xs.to_dtype(self.norm1.weight().dtype())?)?;
-        let xs = xs.to_dtype(orig_dtype)?;
-        let xs = self.attn.forward(&xs, cos, sin, chunks)?;
-        let xs = (residual + xs)?;
-        let residual = xs.clone();
-        let xs = self.mlp.forward(&self.norm2.forward(&xs.to_dtype(self.norm2.weight().dtype())?)?.to_dtype(orig_dtype)?)?;
-        Ok((residual + xs)?)
+
+        let normed = self.norm1.forward(&xs.to_dtype(self.norm1.weight().dtype())?)?;
+        let normed = normed.to_dtype(orig_dtype)?;
+        let attn_out = self.attn.forward(&normed, cos, sin, chunks)?;
+        let xs = xs.add(&attn_out)?;
+        drop(attn_out);
+
+        let normed2 = self.norm2.forward(&xs.to_dtype(self.norm2.weight().dtype())?)?;
+        let normed2 = normed2.to_dtype(orig_dtype)?;
+        let mlp_out = self.mlp.forward(&normed2)?;
+        let xs = xs.add(&mlp_out)?;
+        drop(mlp_out);
+        drop(normed2);
+
+        Ok(xs)
     }
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
